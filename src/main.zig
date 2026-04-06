@@ -336,10 +336,32 @@ fn sendUnicodeCodeUnit(unit: u16) void {
     _ = c.SendInput(@intCast(inputs.len), &inputs, @sizeOf(c.INPUT));
 }
 
+fn sendEnterKey() void {
+    var inputs: [2]c.INPUT = undefined;
+    inputs[0].type = c.INPUT_KEYBOARD;
+    inputs[0].unnamed_0.ki = .{ .wVk = c.VK_RETURN, .wScan = 0, .dwFlags = 0, .time = 0, .dwExtraInfo = 0 };
+    inputs[1].type = c.INPUT_KEYBOARD;
+    inputs[1].unnamed_0.ki = .{ .wVk = c.VK_RETURN, .wScan = 0, .dwFlags = c.KEYEVENTF_KEYUP, .time = 0, .dwExtraInfo = 0 };
+    _ = c.SendInput(@intCast(inputs.len), &inputs, @sizeOf(c.INPUT));
+}
+
 fn sendUtf8Text(text: []const u8) void {
     var view = std.unicode.Utf8View.init(text) catch return;
     var it = view.iterator();
+    var prev_was_cr = false;
     while (it.nextCodepoint()) |cp| {
+        if (cp == '\r') {
+            sendEnterKey();
+            prev_was_cr = true;
+            continue;
+        }
+        if (cp == '\n') {
+            // Handle LF-only and CRLF consistently as one newline in the target app.
+            if (!prev_was_cr) sendEnterKey();
+            prev_was_cr = false;
+            continue;
+        }
+        prev_was_cr = false;
         if (cp <= 0xFFFF) {
             sendUnicodeCodeUnit(@intCast(cp));
         } else if (cp <= 0x10FFFF) {
