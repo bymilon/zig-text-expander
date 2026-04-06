@@ -17,6 +17,7 @@ const SQLITE_OPEN_FULLMUTEX: c_int = 0x00010000;
 
 const MaxTriggerLen: usize = 64;
 const MaxExpansionLen: usize = 1024;
+const SendBatchMaxInputs: usize = 256;
 const ReloadTimerId: usize = 2;
 const ServiceMutexName = "Local\\TextExpanderServiceMutex";
 const StopEventName = "Local\\TextExpanderStopEvent";
@@ -327,51 +328,69 @@ fn sendBackspaces(count: usize) void {
     _ = c.SendInput(@intCast(n), &inputs, @sizeOf(c.INPUT));
 }
 
-fn sendUnicodeCodeUnit(unit: u16) void {
-    var inputs: [2]c.INPUT = undefined;
-    inputs[0].type = c.INPUT_KEYBOARD;
-    inputs[0].unnamed_0.ki = .{ .wVk = 0, .wScan = @as(c.WORD, @intCast(unit)), .dwFlags = c.KEYEVENTF_UNICODE, .time = 0, .dwExtraInfo = 0 };
-    inputs[1].type = c.INPUT_KEYBOARD;
-    inputs[1].unnamed_0.ki = .{ .wVk = 0, .wScan = @as(c.WORD, @intCast(unit)), .dwFlags = c.KEYEVENTF_UNICODE | c.KEYEVENTF_KEYUP, .time = 0, .dwExtraInfo = 0 };
-    _ = c.SendInput(@intCast(inputs.len), &inputs, @sizeOf(c.INPUT));
+fn flushInputBatch(inputs: *[SendBatchMaxInputs]c.INPUT, used: *usize) void {
+    if (used.* == 0) return;
+    _ = c.SendInput(@intCast(used.*), &inputs[0], @sizeOf(c.INPUT));
+    used.* = 0;
 }
 
-fn sendEnterKey() void {
-    var inputs: [2]c.INPUT = undefined;
-    inputs[0].type = c.INPUT_KEYBOARD;
-    inputs[0].unnamed_0.ki = .{ .wVk = c.VK_RETURN, .wScan = 0, .dwFlags = 0, .time = 0, .dwExtraInfo = 0 };
-    inputs[1].type = c.INPUT_KEYBOARD;
-    inputs[1].unnamed_0.ki = .{ .wVk = c.VK_RETURN, .wScan = 0, .dwFlags = c.KEYEVENTF_KEYUP, .time = 0, .dwExtraInfo = 0 };
-    _ = c.SendInput(@intCast(inputs.len), &inputs, @sizeOf(c.INPUT));
+fn pushUnicodeInputPair(inputs: *[SendBatchMaxInputs]c.INPUT, used: *usize, unit: u16) void {
+    if (used.* + 2 > inputs.len) flushInputBatch(inputs, used);
+    inputs[used.*].type = c.INPUT_KEYBOARD;
+    inputs[used.*].unnamed_0.ki = .{ .wVk = 0, .wScan = @as(c.WORD, @intCast(unit)), .dwFlags = c.KEYEVENTF_UNICODE, .time = 0, .dwExtraInfo = 0 };
+    used.* += 1;
+    inputs[used.*].type = c.INPUT_KEYBOARD;
+    inputs[used.*].unnamed_0.ki = .{ .wVk = 0, .wScan = @as(c.WORD, @intCast(unit)), .dwFlags = c.KEYEVENTF_UNICODE | c.KEYEVENTF_KEYUP, .time = 0, .dwExtraInfo = 0 };
+    used.* += 1;
+}
+
+fn pushEnterInputPair(inputs: *[SendBatchMaxInputs]c.INPUT, used: *usize) void {
+    if (used.* + 2 > inputs.len) flushInputBatch(inputs, used);
+    inputs[used.*].type = c.INPUT_KEYBOARD;
+    inputs[used.*].unnamed_0.ki = .{ .wVk = c.VK_RETURN, .wScan = 0, .dwFlags = 0, .time = 0, .dwExtraInfo = 0 };
+    used.* += 1;
+    inputs[used.*].type = c.INPUT_KEYBOARD;
+    inputs[used.*].unnamed_0.ki = .{ .wVk = c.VK_RETURN, .wScan = 0, .dwFlags = c.KEYEVENTF_KEYUP, .time = 0, .dwExtraInfo = 0 };
+    used.* += 1;
 }
 
 fn sendUtf8Text(text: []const u8) void {
+    var batch: [SendBatchMaxInputs]c.INPUT = undefined;
+    var used: usize = 0;
     var view = std.unicode.Utf8View.init(text) catch return;
     var it = view.iterator();
     var prev_was_cr = false;
     while (it.nextCodepoint()) |cp| {
         if (cp == '\r') {
-            sendEnterKey();
+            pushEnterInputPair(&batch, &used);
             prev_was_cr = true;
             continue;
         }
         if (cp == '\n') {
             // Handle LF-only and CRLF consistently as one newline in the target app.
-            if (!prev_was_cr) sendEnterKey();
+            if (!prev_was_cr) pushEnterInputPair(&batch, &used);
             prev_was_cr = false;
             continue;
         }
         prev_was_cr = false;
         if (cp <= 0xFFFF) {
-            sendUnicodeCodeUnit(@intCast(cp));
+            pushUnicodeInputPair(&batch, &used, @intCast(cp));
         } else if (cp <= 0x10FFFF) {
             const value = cp - 0x10000;
             const hi: u16 = @intCast(0xD800 + ((value >> 10) & 0x3FF));
             const lo: u16 = @intCast(0xDC00 + (value & 0x3FF));
-            sendUnicodeCodeUnit(hi);
-            sendUnicodeCodeUnit(lo);
+            pushUnicodeInputPair(&batch, &used, hi);
+            pushUnicodeInputPair(&batch, &used, lo);
         }
     }
+    flushInputBatch(&batch, &used);
+}
+
+fn sendSingleByte(byte: u8) void {
+    var batch: [SendBatchMaxInputs]c.INPUT = undefined;
+    var used: usize = 0;
+    pushUnicodeInputPair(&batch, &used, byte);
+    flushInputBatch(&batch, &used);
 }
 
 fn appendTokenValue(writer: anytype, token: []const u8) !bool {
@@ -503,7 +522,7 @@ fn applyIfMatch(app: *App, delimiter: u8) bool {
         const rendered = renderTemplate(expansion, &rendered_buf) catch expansion;
         sendBackspaces(trigger.len);
         sendUtf8Text(rendered);
-        sendUnicodeCodeUnit(delimiter);
+        sendSingleByte(delimiter);
         return true;
     }
 
