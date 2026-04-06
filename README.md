@@ -1,82 +1,142 @@
 # text-expander
 
-Windows text expander written in Zig with SQLite storage.
+Minimal, production-minded Windows text expander built with Zig and SQLite.
 
-## What it does
+`text-expander` runs as a background service, expands typed triggers globally (for example `:bb` -> `be right back.`), and stores snippets in a local SQLite database.
 
-- Global text expansion (`:bb` -> `be right back.`).
-- Uses Windows-native `winsqlite3.dll` dynamically (no external SQLite install required).
-- Stores snippets in `%LOCALAPPDATA%\\TextExpander\\snippets.db`.
-- Quit hotkey while running: `Ctrl+Shift+Q`.
+## Why this project
 
-## Commands
+- Fast, native, low-overhead runtime.
+- SQLite-backed snippet storage.
+- Scriptable CLI for automation and ops.
+- Optional terminal UI (TUI) for snippet browsing/editing.
+
+## Features
+
+- Global expansion in Windows apps.
+- Background service lifecycle: `start`, `run`, `stop`, `status`.
+- Hot reload of snippet changes (no service restart needed for DB edits).
+- Multiline snippet support via `addm`.
+- Template tokens in expansions:
+  - `{{date}}` -> `YYYY-MM-DD`
+  - `{{time}}` -> `HH:MM`
+  - `{{datetime}}` -> `YYYY-MM-DD HH:MM`
+  - `{{iso_datetime}}` -> ISO local datetime
+  - `{{year}}`, `{{month}}`, `{{day}}`
+- Built-in safety controls:
+  - Trigger validation (`:` prefix, `[A-Za-z0-9_-]`).
+  - Max trigger and expansion limits.
+  - Injected-key filtering to prevent recursive loops.
+
+## Requirements
+
+- Windows
+- Zig `0.15.2` or newer compatible with this repo
+- `winsqlite3.dll` (available on supported Windows versions)
+
+## Build
+
+Build core CLI:
 
 ```powershell
-text-expander.exe run
-text-expander.exe start
-text-expander.exe stop
-text-expander.exe status
-text-expander.exe add :bb "be right back."
-@"
-Best regards,
-Team
-"@ | text-expander.exe addm :sig
-text-expander.exe remove :bb
-text-expander.exe list
-text-expander.exe doctor
-text-expander.exe tui
+zig build
 ```
 
-## Build (manual)
-
-Use your working Zig binary path:
+Build TUI:
 
 ```powershell
-zig build-exe src/main.zig -lc -fno-emit-bin
+zig build tui
 ```
 
-For a release executable, use this on a normal local environment:
+Manual release build (CLI exe):
 
 ```powershell
 mkdir dist
 zig build-exe src/main.zig -O ReleaseSafe -lc -luser32 -femit-bin=dist/text-expander.exe
 ```
 
-Or use:
+Or use the release helper:
 
 ```powershell
-./scripts/build-release.ps1
+.\scripts\build-release.ps1
 ```
 
-## Start using
-
-1. Build the release executable.
-2. Run `text-expander.exe doctor` once.
-3. Run `text-expander.exe add :bb "be right back."`.
-4. Run `text-expander.exe start` (background mode).
-5. In any app, type `:bb` then space.
-
-## Production notes
-
-- Trigger validation enforces `:` prefix and `[A-Za-z0-9_-]`.
-- SQL access uses prepared statements and bound parameters.
-- Runtime ignores injected keystrokes to avoid recursive expansion loops.
-- CLI commands print the SQLite DB file path (`db: ...`) for support/debugging.
-- Multiline snippets are supported through `addm` (read from stdin).
-
-## TUI (tui.zig)
-
-Raycast/Linear-inspired minimal snippet manager UI is available in `src/tui_main.zig`.
-
-Install `tui.zig` dependency first:
+## Quick start
 
 ```powershell
-zig fetch --save git+https://github.com/muhammad-fiaz/tui.zig.git
+.\dist\text-expander.exe doctor
+.\dist\text-expander.exe add :bb "be right back."
+.\dist\text-expander.exe start
+.\dist\text-expander.exe status
 ```
 
-Then build and run the TUI:
+Then type `:bb` + space in any app.
+
+## CLI reference
+
+```text
+text-expander                 # start background service
+text-expander start           # start background service
+text-expander run             # run foreground (blocking)
+text-expander stop            # stop service
+text-expander status          # show status + db path
+text-expander add :key "..."  # add/update single-line snippet
+text-expander addm :key       # add/update multiline snippet from stdin
+text-expander remove :key     # delete snippet
+text-expander list            # list snippets
+text-expander doctor          # health check
+text-expander tui             # prints TUI launch target
+text-expander help            # usage
+```
+
+## TUI
+
+The project includes a minimal, keyboard-first TUI powered by `libvaxis`.
+
+Run:
 
 ```powershell
 zig build tui
 .\zig-out\bin\text-expander-tui.exe
 ```
+
+## Database location
+
+Default DB path:
+
+`%LOCALAPPDATA%\TextExpander\snippets.db`
+
+Most CLI commands print `db: ...` to make support/debugging straightforward.
+
+## Open source roadmap
+
+Planned work is tracked in [LINEAR_TODO.md](LINEAR_TODO.md), organized by:
+
+- `P0` ship-ready baseline
+- `P1` production hardening
+- `P2` enterprise readiness
+
+## For contributors
+
+- Keep changes small and focused.
+- Preserve Windows reliability first (hook stability, safe shutdown, no recursive input).
+- Prefer prepared statements and bounded memory operations.
+- Validate with:
+  - `zig build`
+  - `zig build tui`
+  - manual smoke test: `start`, type trigger, `stop`
+
+## For AI agents
+
+If you are an autonomous coding agent working in this repo:
+
+- Read `build.zig` first to understand targets (`text-expander`, `text-expander-tui`).
+- Treat `src/main.zig` as the service/CLI source of truth.
+- Keep DB schema backward compatible unless migration is explicit.
+- Do not introduce non-Windows assumptions into runtime code paths.
+- Keep commands and docs synchronized whenever CLI behavior changes.
+
+## Project links
+
+- X / updates: [@milonspace](https://x.com/milonspace)
+- Repository: [bymilon/zig-text-expander](https://github.com/bymilon/zig-text-expander)
