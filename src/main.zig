@@ -41,6 +41,8 @@ const App = struct {
     db: *sqlite3,
     hook: c.HHOOK,
     snippets: std.ArrayList(SnippetEntry) = .empty,
+    snippet_index: std.StringHashMap([]const u8),
+    snippet_version: u64 = 0,
     char_buffer: [MaxTriggerLen]u8 = undefined,
     char_len: usize = 0,
 };
@@ -310,15 +312,19 @@ fn isDelimiter(ch: u8, vk: c.DWORD) bool {
 }
 
 fn sendBackspaces(count: usize) void {
+    if (count == 0) return;
+    var inputs: [MaxTriggerLen * 2]c.INPUT = undefined;
+    var n: usize = 0;
     var i: usize = 0;
-    while (i < count) : (i += 1) {
-        var inputs: [2]c.INPUT = undefined;
-        inputs[0].type = c.INPUT_KEYBOARD;
-        inputs[0].unnamed_0.ki = .{ .wVk = c.VK_BACK, .wScan = 0, .dwFlags = 0, .time = 0, .dwExtraInfo = 0 };
-        inputs[1].type = c.INPUT_KEYBOARD;
-        inputs[1].unnamed_0.ki = .{ .wVk = c.VK_BACK, .wScan = 0, .dwFlags = c.KEYEVENTF_KEYUP, .time = 0, .dwExtraInfo = 0 };
-        _ = c.SendInput(@intCast(inputs.len), &inputs, @sizeOf(c.INPUT));
+    while (i < count and n + 1 < inputs.len) : (i += 1) {
+        inputs[n].type = c.INPUT_KEYBOARD;
+        inputs[n].unnamed_0.ki = .{ .wVk = c.VK_BACK, .wScan = 0, .dwFlags = 0, .time = 0, .dwExtraInfo = 0 };
+        n += 1;
+        inputs[n].type = c.INPUT_KEYBOARD;
+        inputs[n].unnamed_0.ki = .{ .wVk = c.VK_BACK, .wScan = 0, .dwFlags = c.KEYEVENTF_KEYUP, .time = 0, .dwExtraInfo = 0 };
+        n += 1;
     }
+    _ = c.SendInput(@intCast(n), &inputs, @sizeOf(c.INPUT));
 }
 
 fn sendUnicodeCodeUnit(unit: u16) void {
@@ -346,12 +352,88 @@ fn sendUtf8Text(text: []const u8) void {
     }
 }
 
+fn appendTokenValue(writer: anytype, token: []const u8) !bool {
+    var st: c.SYSTEMTIME = undefined;
+    c.GetLocalTime(&st);
+
+    if (std.mem.eql(u8, token, "date")) {
+        try writer.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ st.wYear, st.wMonth, st.wDay });
+        return true;
+    }
+    if (std.mem.eql(u8, token, "time")) {
+        try writer.print("{d:0>2}:{d:0>2}", .{ st.wHour, st.wMinute });
+        return true;
+    }
+    if (std.mem.eql(u8, token, "datetime")) {
+        try writer.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{ st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute });
+        return true;
+    }
+    if (std.mem.eql(u8, token, "iso_datetime")) {
+        try writer.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{ st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond });
+        return true;
+    }
+    if (std.mem.eql(u8, token, "year")) {
+        try writer.print("{d:0>4}", .{st.wYear});
+        return true;
+    }
+    if (std.mem.eql(u8, token, "month")) {
+        try writer.print("{d:0>2}", .{st.wMonth});
+        return true;
+    }
+    if (std.mem.eql(u8, token, "day")) {
+        try writer.print("{d:0>2}", .{st.wDay});
+        return true;
+    }
+    return false;
+}
+
+fn renderTemplate(input: []const u8, out_buf: []u8) ![]const u8 {
+    var stream = std.io.fixedBufferStream(out_buf);
+    const writer = stream.writer();
+
+    var i: usize = 0;
+    while (i < input.len) {
+        if (i + 1 < input.len and input[i] == '{' and input[i + 1] == '{') {
+            var j = i + 2;
+            while (j + 1 < input.len and !(input[j] == '}' and input[j + 1] == '}')) : (j += 1) {}
+            if (j + 1 < input.len) {
+                const raw_token = std.mem.trim(u8, input[i + 2 .. j], " \t\r\n");
+                const handled = try appendTokenValue(writer, raw_token);
+                if (!handled) {
+                    try writer.writeAll(input[i .. j + 2]);
+                }
+                i = j + 2;
+                continue;
+            }
+        }
+        try writer.writeByte(input[i]);
+        i += 1;
+    }
+
+    return stream.getWritten();
+}
+
 fn clearSnippetCache(app: *App) void {
+    app.snippet_index.clearRetainingCapacity();
     for (app.snippets.items) |entry| {
         app.allocator.free(entry.trigger);
         app.allocator.free(entry.expansion);
     }
     app.snippets.clearRetainingCapacity();
+}
+
+fn querySnippetVersion(sql_api: *const SqliteApi, db: *sqlite3) !u64 {
+    const sql = "SELECT IFNULL(MAX(updated_at), 0), COUNT(*) FROM snippets WHERE enabled = 1";
+    var stmt_opt: ?*sqlite3_stmt = null;
+    if (sql_api.sqlite3_prepare_v2(db, sql, -1, &stmt_opt, null) != SQLITE_OK or stmt_opt == null) return error.PrepareFailed;
+    const stmt = stmt_opt.?;
+    defer _ = sql_api.sqlite3_finalize(stmt);
+
+    const rc = sql_api.sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) return error.StepFailed;
+    const max_updated: u32 = @intCast(sql_api.sqlite3_column_int(stmt, 0));
+    const count: u32 = @intCast(sql_api.sqlite3_column_int(stmt, 1));
+    return (@as(u64, max_updated) << 32) | @as(u64, count);
 }
 
 fn reloadSnippetCache(sql_api: *const SqliteApi, app: *App) !void {
@@ -378,14 +460,14 @@ fn reloadSnippetCache(sql_api: *const SqliteApi, app: *App) !void {
             .trigger = try app.allocator.dupe(u8, trig),
             .expansion = try app.allocator.dupe(u8, exp),
         });
+        const last = app.snippets.items[app.snippets.items.len - 1];
+        try app.snippet_index.put(last.trigger, last.expansion);
     }
+    app.snippet_version = try querySnippetVersion(sql_api, app.db);
 }
 
 fn lookupExpansionInCache(app: *App, trigger: []const u8) ?[]const u8 {
-    for (app.snippets.items) |entry| {
-        if (std.mem.eql(u8, entry.trigger, trigger)) return entry.expansion;
-    }
-    return null;
+    return app.snippet_index.get(trigger);
 }
 
 fn applyIfMatch(app: *App, delimiter: u8) bool {
@@ -395,8 +477,10 @@ fn applyIfMatch(app: *App, delimiter: u8) bool {
     if (trigger[0] != ':') return false;
 
     if (lookupExpansionInCache(app, trigger)) |expansion| {
+        var rendered_buf: [MaxExpansionLen * 4]u8 = undefined;
+        const rendered = renderTemplate(expansion, &rendered_buf) catch expansion;
         sendBackspaces(trigger.len);
-        sendUtf8Text(expansion);
+        sendUtf8Text(rendered);
         sendUnicodeCodeUnit(delimiter);
         return true;
     }
@@ -542,10 +626,13 @@ fn runService(allocator: std.mem.Allocator, paths: *const Paths, sql_api: *const
         .db = db,
         .hook = null,
         .snippets = .empty,
+        .snippet_index = std.StringHashMap([]const u8).init(allocator),
+        .snippet_version = 0,
         .char_buffer = undefined,
         .char_len = 0,
     };
     defer clearSnippetCache(&app);
+    defer app.snippet_index.deinit();
     try reloadSnippetCache(sql_api, &app);
     g_app = &app;
 
@@ -584,7 +671,10 @@ fn runService(allocator: std.mem.Allocator, paths: *const Paths, sql_api: *const
                 break;
             }
             if (msg.message == c.WM_TIMER and msg.wParam == ReloadTimerId) {
-                reloadSnippetCache(sql_api, &app) catch {};
+                const current_version = querySnippetVersion(sql_api, app.db) catch app.snippet_version;
+                if (current_version != app.snippet_version) {
+                    reloadSnippetCache(sql_api, &app) catch {};
+                }
                 continue;
             }
             _ = c.TranslateMessage(&msg);
