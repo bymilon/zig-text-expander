@@ -1,0 +1,345 @@
+const std = @import("std");
+
+const c = @cImport({
+    @cDefine("WIN32_LEAN_AND_MEAN", "1");
+    @cInclude("windows.h");
+});
+
+const sqlite3 = opaque {};
+const sqlite3_stmt = opaque {};
+
+const SQLITE_OK: c_int = 0;
+const SQLITE_ROW: c_int = 100;
+const SQLITE_DONE: c_int = 101;
+const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
+const SQLITE_OPEN_CREATE: c_int = 0x00000004;
+const SQLITE_OPEN_FULLMUTEX: c_int = 0x00010000;
+
+extern fn sqlite3_open_v2(filename: [*:0]const u8, ppDb: *?*sqlite3, flags: c_int, zVfs: ?[*:0]const u8) c_int;
+extern fn sqlite3_close_v2(db: *sqlite3) c_int;
+extern fn sqlite3_exec(
+    db: *sqlite3,
+    sql: [*:0]const u8,
+    callback: ?*const fn (?*anyopaque, c_int, [*]?[*:0]u8, [*]?[*:0]u8) callconv(.c) c_int,
+    arg: ?*anyopaque,
+    errmsg: ?*?[*:0]u8,
+) c_int;
+extern fn sqlite3_free(ptr: ?*anyopaque) void;
+extern fn sqlite3_errmsg(db: *sqlite3) [*:0]const u8;
+extern fn sqlite3_busy_timeout(db: *sqlite3, ms: c_int) c_int;
+extern fn sqlite3_prepare_v2(db: *sqlite3, zSql: [*:0]const u8, nByte: c_int, ppStmt: *?*sqlite3_stmt, pzTail: ?*?[*:0]const u8) c_int;
+extern fn sqlite3_bind_text(stmt: *sqlite3_stmt, idx: c_int, value: [*:0]const u8, n: c_int, destructor: ?*const fn (?*anyopaque) callconv(.c) void) c_int;
+extern fn sqlite3_step(stmt: *sqlite3_stmt) c_int;
+extern fn sqlite3_finalize(stmt: *sqlite3_stmt) c_int;
+extern fn sqlite3_column_text(stmt: *sqlite3_stmt, iCol: c_int) ?[*:0]const u8;
+
+const App = struct {
+    allocator: std.mem.Allocator,
+    db: *sqlite3,
+    hook: c.HHOOK,
+    char_buffer: [64]u8 = undefined,
+    char_len: usize = 0,
+};
+
+var g_app: ?*App = null;
+
+fn log(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt ++ "\n", args);
+}
+
+fn fatalDb(db: *sqlite3, comptime context: []const u8) noreturn {
+    const msg = sqlite3_errmsg(db);
+    log("{s}: {s}", .{ context, msg });
+    std.process.exit(1);
+}
+
+fn executeSql(db: *sqlite3, sql: [:0]const u8) !void {
+    var errmsg: ?[*:0]u8 = null;
+    const rc = sqlite3_exec(db, sql.ptr, null, null, &errmsg);
+    if (rc != SQLITE_OK) {
+        defer if (errmsg) |p| sqlite3_free(@ptrCast(p));
+        return error.SqlExecFailed;
+    }
+}
+
+fn ensureSchema(db: *sqlite3) !void {
+    try executeSql(db,
+        \\PRAGMA journal_mode = WAL;
+        \\PRAGMA synchronous = NORMAL;
+        \\CREATE TABLE IF NOT EXISTS snippets (
+        \\  trigger TEXT PRIMARY KEY,
+        \\  expansion TEXT NOT NULL,
+        \\  enabled INTEGER NOT NULL DEFAULT 1,
+        \\  updated_at INTEGER NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS settings (
+        \\  key TEXT PRIMARY KEY,
+        \\  value TEXT NOT NULL
+        \\);
+        \\CREATE TABLE IF NOT EXISTS events (
+        \\  id INTEGER PRIMARY KEY,
+        \\  ts INTEGER NOT NULL,
+        \\  type TEXT NOT NULL,
+        \\  detail TEXT NOT NULL
+        \\);
+        \\INSERT INTO snippets(trigger, expansion, enabled, updated_at)
+        \\VALUES(':bb', 'be right back.', 1, unixepoch())
+        \\ON CONFLICT(trigger) DO NOTHING;
+    );
+}
+
+fn initDb(allocator: std.mem.Allocator) !*sqlite3 {
+    const local_app_data = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch {
+        return error.MissingLocalAppData;
+    };
+    defer allocator.free(local_app_data);
+
+    const dir_path = try std.fmt.allocPrint(allocator, "{s}\\TextExpander", .{local_app_data});
+    defer allocator.free(dir_path);
+    try std.fs.cwd().makePath(dir_path);
+
+    const db_path_plain = try std.fmt.allocPrint(allocator, "{s}\\snippets.db", .{dir_path});
+    defer allocator.free(db_path_plain);
+    const db_path = try allocator.allocSentinel(u8, db_path_plain.len, 0);
+    defer allocator.free(db_path);
+    @memcpy(db_path[0..db_path_plain.len], db_path_plain);
+
+    var db_opt: ?*sqlite3 = null;
+    const flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
+    const rc = sqlite3_open_v2(db_path, &db_opt, flags, null);
+    if (rc != SQLITE_OK or db_opt == null) {
+        return error.SqlOpenFailed;
+    }
+    const db = db_opt.?;
+
+    if (sqlite3_busy_timeout(db, 3000) != SQLITE_OK) {
+        fatalDb(db, "sqlite3_busy_timeout failed");
+    }
+
+    try ensureSchema(db);
+    return db;
+}
+
+fn trimToLowerAscii(byte: u8) u8 {
+    if (byte >= 'A' and byte <= 'Z') return byte + 32;
+    return byte;
+}
+
+fn vkToAscii(vk: c.DWORD) ?u8 {
+    const shift_pressed = (@as(u16, @bitCast(c.GetAsyncKeyState(c.VK_SHIFT))) & 0x8000) != 0;
+    const caps_on = (c.GetKeyState(c.VK_CAPITAL) & 0x1) != 0;
+
+    if (vk >= 'A' and vk <= 'Z') {
+        const ch: u8 = @intCast(vk);
+        const upper = shift_pressed != caps_on;
+        return if (upper) ch else trimToLowerAscii(ch);
+    }
+    if (vk >= '0' and vk <= '9') {
+        return @intCast(vk);
+    }
+    if (vk == c.VK_SPACE) return ' ';
+    if (vk == c.VK_OEM_1) return if (shift_pressed) ':' else ';';
+    if (vk == c.VK_OEM_PERIOD) return '.';
+    if (vk == c.VK_OEM_COMMA) return ',';
+    if (vk == c.VK_OEM_2) return if (shift_pressed) '?' else '/';
+    if (vk == c.VK_OEM_MINUS) return if (shift_pressed) '_' else '-';
+    return null;
+}
+
+fn isDelimiter(ch: u8, vk: c.DWORD) bool {
+    if (vk == c.VK_RETURN or vk == c.VK_TAB) return true;
+    return ch == ' ' or ch == '.' or ch == ',' or ch == ':' or ch == ';' or ch == '?';
+}
+
+fn sendBackspaces(count: usize) void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        var inputs: [2]c.INPUT = undefined;
+        inputs[0].type = c.INPUT_KEYBOARD;
+        inputs[0].unnamed_0.ki = .{
+            .wVk = c.VK_BACK,
+            .wScan = 0,
+            .dwFlags = 0,
+            .time = 0,
+            .dwExtraInfo = 0,
+        };
+        inputs[1].type = c.INPUT_KEYBOARD;
+        inputs[1].unnamed_0.ki = .{
+            .wVk = c.VK_BACK,
+            .wScan = 0,
+            .dwFlags = c.KEYEVENTF_KEYUP,
+            .time = 0,
+            .dwExtraInfo = 0,
+        };
+        _ = c.SendInput(@intCast(inputs.len), &inputs, @sizeOf(c.INPUT));
+    }
+}
+
+fn sendUnicodeByte(ch: u8) void {
+    var inputs: [2]c.INPUT = undefined;
+    inputs[0].type = c.INPUT_KEYBOARD;
+    inputs[0].unnamed_0.ki = .{
+        .wVk = 0,
+        .wScan = @as(c.WORD, ch),
+        .dwFlags = c.KEYEVENTF_UNICODE,
+        .time = 0,
+        .dwExtraInfo = 0,
+    };
+    inputs[1].type = c.INPUT_KEYBOARD;
+    inputs[1].unnamed_0.ki = .{
+        .wVk = 0,
+        .wScan = @as(c.WORD, ch),
+        .dwFlags = c.KEYEVENTF_UNICODE | c.KEYEVENTF_KEYUP,
+        .time = 0,
+        .dwExtraInfo = 0,
+    };
+    _ = c.SendInput(@intCast(inputs.len), &inputs, @sizeOf(c.INPUT));
+}
+
+fn sendText(text: []const u8) void {
+    for (text) |ch| sendUnicodeByte(ch);
+}
+
+fn lookupExpansion(db: *sqlite3, trigger: []const u8, out: []u8) !?[]const u8 {
+    const sql = "SELECT expansion FROM snippets WHERE trigger = ?1 AND enabled = 1 LIMIT 1";
+
+    var stmt_opt: ?*sqlite3_stmt = null;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt_opt, null) != SQLITE_OK or stmt_opt == null) {
+        return error.PrepareFailed;
+    }
+    const stmt = stmt_opt.?;
+    defer _ = sqlite3_finalize(stmt);
+
+    const z_trigger = try std.fmt.bufPrintZ(out, "{s}", .{trigger});
+    if (sqlite3_bind_text(stmt, 1, z_trigger.ptr, -1, null) != SQLITE_OK) {
+        return error.BindFailed;
+    }
+
+    const step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
+        const raw = sqlite3_column_text(stmt, 0) orelse return null;
+        const expansion = std.mem.span(raw);
+        if (expansion.len > out.len) return error.ExpansionTooLong;
+        @memcpy(out[0..expansion.len], expansion);
+        return out[0..expansion.len];
+    }
+    if (step_rc != SQLITE_DONE) return error.StepFailed;
+    return null;
+}
+
+fn applyIfMatch(app: *App, delimiter: u8) bool {
+    if (app.char_len == 0) return false;
+
+    var scratch: [256]u8 = undefined;
+    const trigger = app.char_buffer[0..app.char_len];
+    const result = lookupExpansion(app.db, trigger, &scratch) catch |err| {
+        log("lookup failed: {}", .{err});
+        return false;
+    };
+    if (result) |expansion| {
+        sendBackspaces(trigger.len);
+        sendText(expansion);
+        sendUnicodeByte(delimiter);
+        log("expanded '{s}' -> '{s}'", .{ trigger, expansion });
+        return true;
+    }
+    return false;
+}
+
+export fn keyboardProc(nCode: c_int, wParam: c.WPARAM, lParam: c.LPARAM) callconv(.winapi) c.LRESULT {
+    if (nCode < c.HC_ACTION or g_app == null) {
+        return c.CallNextHookEx(null, nCode, wParam, lParam);
+    }
+
+    if (wParam != c.WM_KEYDOWN and wParam != c.WM_SYSKEYDOWN) {
+        return c.CallNextHookEx(null, nCode, wParam, lParam);
+    }
+
+    const info: *const c.KBDLLHOOKSTRUCT = @ptrFromInt(@as(usize, @intCast(lParam)));
+    if ((info.flags & c.LLKHF_INJECTED) != 0) {
+        return c.CallNextHookEx(null, nCode, wParam, lParam);
+    }
+
+    var app = g_app.?;
+
+    if (info.vkCode == c.VK_BACK) {
+        if (app.char_len > 0) app.char_len -= 1;
+        return c.CallNextHookEx(null, nCode, wParam, lParam);
+    }
+
+    const ch_opt = vkToAscii(info.vkCode);
+    if (ch_opt == null) {
+        if (info.vkCode == c.VK_RETURN or info.vkCode == c.VK_TAB) {
+            const delimiter: u8 = if (info.vkCode == c.VK_RETURN) '\r' else '\t';
+            const consumed = applyIfMatch(app, delimiter);
+            app.char_len = 0;
+            if (consumed) return 1;
+        }
+        return c.CallNextHookEx(null, nCode, wParam, lParam);
+    }
+    const ch = ch_opt.?;
+
+    if (isDelimiter(ch, info.vkCode)) {
+        const consumed = applyIfMatch(app, ch);
+        app.char_len = 0;
+        if (consumed) return 1;
+        return c.CallNextHookEx(null, nCode, wParam, lParam);
+    }
+
+    if (app.char_len < app.char_buffer.len) {
+        app.char_buffer[app.char_len] = trimToLowerAscii(ch);
+        app.char_len += 1;
+    } else {
+        std.mem.copyForwards(u8, app.char_buffer[0 .. app.char_buffer.len - 1], app.char_buffer[1..]);
+        app.char_buffer[app.char_buffer.len - 1] = trimToLowerAscii(ch);
+    }
+
+    return c.CallNextHookEx(null, nCode, wParam, lParam);
+}
+
+pub fn main() !void {
+    if (@import("builtin").os.tag != .windows) {
+        log("This minimal text expander currently supports Windows only.", .{});
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const db = try initDb(allocator);
+    defer _ = sqlite3_close_v2(db);
+
+    var app = App{
+        .allocator = allocator,
+        .db = db,
+        .hook = null,
+        .char_buffer = undefined,
+        .char_len = 0,
+    };
+    g_app = &app;
+
+    const module = c.GetModuleHandleW(null);
+    app.hook = c.SetWindowsHookExW(c.WH_KEYBOARD_LL, keyboardProc, module, 0);
+    if (app.hook == null) {
+        log("failed to install keyboard hook, error={}", .{c.GetLastError()});
+        return error.HookInstallFailed;
+    }
+    defer _ = c.UnhookWindowsHookEx(app.hook);
+
+    if (c.RegisterHotKey(null, 1, c.MOD_CONTROL | c.MOD_SHIFT, 'Q') == 0) {
+        log("warning: failed to register Ctrl+Shift+Q quit hotkey", .{});
+    } else {
+        defer _ = c.UnregisterHotKey(null, 1);
+    }
+
+    log("text-expander running. type ':bb' + delimiter to expand.", .{});
+    log("press Ctrl+Shift+Q to quit.", .{});
+
+    var msg: c.MSG = undefined;
+    while (c.GetMessageW(&msg, null, 0, 0) > 0) {
+        if (msg.message == c.WM_HOTKEY and msg.wParam == 1) break;
+        _ = c.TranslateMessage(&msg);
+        _ = c.DispatchMessageW(&msg);
+    }
+}

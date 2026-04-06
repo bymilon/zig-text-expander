@@ -1,0 +1,22 @@
+# Zig build outputs and caches
+.zig-cache/
+.zig-cache2/
+.zig-global-cache/
+run-cache/
+run-gcache/
+zig-out/
+
+# Local build artifacts
+dist/
+*.exe
+*.obj
+*.o
+*.lib
+*.dll
+*.pdb
+
+# Editors / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
